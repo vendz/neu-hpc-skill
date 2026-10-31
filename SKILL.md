@@ -25,27 +25,78 @@ description: >
 
 1. **NEVER run compute-intensive tasks on login nodes.** Always submit via `srun` (interactive) or `sbatch` (batch).
 2. **Always request only the resources you need** — over-requesting hurts your fair-share score AND increases queue wait time.
-3. **`/scratch/<username>`** is purged monthly. Move important files to `/home/<username>` promptly.
+3. **`/scratch/<username>`** is purged in the monthly maintenance window (first Tuesday; 20TB / 20M files limit; no backups). Copy results to `/home/<username>` after every job.
 4. **Home directory quota is 75GB.** Conda envs eat space fast; clean caches with `conda clean --all`.
 5. **Load modules inside sbatch scripts or after getting a compute node**, not in `.bashrc`.
-6. **The `explorer` module** loads automatically and sets the HTTP proxy. If accidentally purged, log out and back in.
+6. **The `explorer` module** loads automatically and sets the HTTP proxy (`module load explorer` restores it after `module purge`). The proxy also catches `localhost` traffic — see "Proxy trap" below.
+7. **Every GPU submission costs queue time you can't get back.** Read "Scheduling" below before you submit anything to a GPU partition.
+8. **Never submit a duplicate job.** `sbatch` sometimes prints an error ("Unexpected message received") and still creates the job — always run `squeue -u <username>` before retrying.
+9. **The cluster is free (no money).** The only cost is fair-share priority. Say "uses priority", never "charged".
 
-## Fair-Share Scheduling
+## Scheduling: how it works and how not to waste queue time
 
-Explorer uses **fair-share scheduling** — your job priority depends on your group's recent resource usage.
+### How priority works
+Slurm orders pending jobs by priority. Sources: [queuing docs](https://rc-docs.northeastern.edu/en/latest/runningjobs/understandingqueuing.html), [partitions](https://rc.northeastern.edu/partitions/).
 
-| Factor | Effect on priority |
+| Factor | Effect |
 |---|---|
-| High recent usage by your group | Priority decreases |
-| Low recent usage by your group | Priority increases |
-| Smaller job (fewer nodes) | Higher priority |
-| Longer time in queue | Priority increases over time |
+| **Fair-share** (your account's recent usage) | Heavy recent use → lower priority for **everyone in the account** (e.g. a course account shared by a whole class) |
+| **Job size** | Fewer nodes/resources → higher priority, and easier to fit into gaps |
+| **Age** | Priority rises the longer a job waits |
+| Requesting max nodes/tasks | Does **not** make it run faster or raise priority |
 
-**Practical impact:**
-- Every `srun` session you leave idle burns fair-share budget for the whole group — `scancel` when done.
-- Don't request 8 GPUs "just in case" — each wasted resource-hour penalizes future jobs.
-- Break large sweeps into smaller jobs; small jobs queue faster AND preserve fair-share.
-- Check your group's current standing: `sshare -u <username>` (higher LevelFS = better priority).
+- Check standing: `sshare -u <username>` (FairShare near 1 = good, near 0 = you are behind most users), `sprio -u <username>` (priority breakdown of your pending jobs).
+- Observed on this cluster (Oct 2026, not in the docs): billing counts **GPU = 100, CPU = 1 per hour, the same for every GPU type**. One H200-hour costs the same priority as one V100-hour — so a faster GPU that finishes sooner is *cheaper* in priority, but popular types wait longer.
+- Pending reasons (`squeue -u <username> -o "%i %j %T %r"`): `Priority` = higher-priority jobs are ahead (just wait); `Resources` = waiting for a free card of that type; `QOSMaxJobsPerUserLimit` = you hit your running-job cap; `QOSMaxSubmitJobPerUserLimit` = you hit the submit cap (job rejected); `JobHeldUser` = you held it.
+
+### Backfill: why short, accurate `--time` matters
+The scheduler lets small jobs jump ahead if they finish before a big job's reserved start ("backfill"). A job with an honest short `--time` fits these gaps; a job asking for the 8 h maximum "just in case" does not. Set `--time` to about 1.3–1.5x the expected runtime. A job that hits its limit is killed, so pair a tight limit with checkpointing.
+
+### Start-time estimates are unreliable
+`squeue --start -j <id>` and `sbatch --test-only ...` give estimates that the docs call "a bit inaccurate". Observed: every GPU type and even a 30-min CPU job all showed ~36 h — Slurm assumes every running job uses its full time limit. Real starts were often minutes to hours. Use estimates only to *compare* options (e.g. H200 vs A100), never to promise a time to the user.
+
+### The cost of "randomly sending jobs"
+| Bad habit | What it costs |
+|---|---|
+| A separate job for each small step (smoke test, then pilot, then eval) | Each job waits in the queue again. With low fair-share that can be hours to a day **per step**. |
+| Cancel and resubmit to "fix" a pending job | Loses accumulated age priority; back of the line |
+| Submitting many speculative jobs | Burns fair-share for the whole account; hits the 8-submitted / 4-running cap on `gpu` |
+| Asking for 8 h, 8 CPUs, 64 GB for a 1 h job | Can't backfill; lowers future priority via billing |
+| A GPU job that fails 5 min in (missing file, bad path, proxy) | All the queue wait is wasted; resubmitting waits again |
+| GPU job doing CPU-only work (downloads, env builds, CPU benchmarks, long eval on CPU) | Idle GPU → IdleBot email, possible cancel; burns 100x CPU priority |
+| `srun` session left open | Same as above |
+
+### Workflow that minimizes queue time
+1. **Prepare everything on CPU first** (partition `short`/`express`/`debug`, or the Mac): env builds, model/data downloads into `HF_HOME` on scratch, data prep. A GPU job should start computing within minutes.
+2. **Dry-run the GPU job script on a CPU node** with the GPU parts stubbed or tiny (e.g. 20 steps on CPU). Catch path, import, proxy and quoting bugs before you queue.
+3. **One GPU job per phase chain.** Put smoke test → real work → eval in **one** allocation, with in-job go/no-go checks that `exit` early (freeing the GPU) when a check fails. Never "smoke-test, then resubmit for real."
+4. **Pack many small runs into one job** (loop over configs inside one allocation, or a small array with `%N`) instead of many separate submissions.
+5. **Make work resumable** (append-only outputs, skip finished items, checkpoint every 10–15 min, keep only the latest checkpoint), and copy results to `/home` after each phase and in a `trap ... EXIT`. Then a time-limit kill loses nothing.
+6. **Pick the GPU by fit, then by queue**: smallest card whose memory fits, compared with `sbatch --test-only` (see GPU table). `gpu-short` (≤ 2 h) has higher priority than `gpu`; use it for jobs that truly fit in 2 h.
+7. **Don't touch a pending job unless it's wrong.** If code must change while a job waits: Slurm **copies the batch script at submit time**, but any script/file the job *calls* is read when it starts — put changeable logic in a callee on `/scratch` and replace it atomically (write temp, verify, `mv`). Holding a job (`scontrol hold <id>`, `scontrol release <id>`) keeps its place in the list but it does not start; a long hold likely costs age priority.
+8. **Check before you submit:** `squeue -u <username>` (no duplicates), `sshare -u <username>` (priority), `sinfo -p gpu -o "%G %D %T"` (what exists).
+9. **After a job:** `seff <jobid>`; for GPU use `historical-seff --starttime YYYY-MM-DD` and `gpu-logs <jobid>` (run from `srun -p short --constraint=ib --pty bash`). Shrink the next request to match what was used.
+
+### Idle GPU policy (IdleBot)
+IdleBot watches public GPU nodes: email after **15 min** under-used, job **cancelled after 1 h** ([idlebot docs](https://rc-docs.northeastern.edu/en/latest/gpus/idlebot.html)). Graphs land in `/scratch/<username>/idle_bot_graphs/<jobid>.png`. Put an in-job watchdog in every GPU batch job so you never get the email:
+```bash
+( idle=0; while sleep 60; do
+    u=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -1)
+    if [ "${u:-0}" -lt 10 ]; then idle=$((idle+1)); else idle=0; fi
+    [ $idle -ge 10 ] && { echo "EVICTED: GPU <10% for 10 min"; scancel $SLURM_JOB_ID; }
+  done ) &
+```
+Start the watchdog only **after** slow startup (model load, server start) finishes, and keep CPU-only phases inside the job under ~5 min.
+
+### Proxy trap (localhost servers)
+Jobs inherit `http_proxy`/`https_proxy` (10.99.0.130:3128) from the submit shell. Requests to a server you start inside the job (vLLM, Jupyter, any `localhost`/`127.0.0.1` URL) then go **through the proxy and get HTTP 403**. In every job that talks to a local server:
+```bash
+export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
+```
+Also pick a free random port (other users share the node) and check that `/v1/models` lists *your* model before using the server.
+
+### GPU drivers and CUDA wheels
+Observed Oct 2026: H200 node driver **570.86.15** (native CUDA ≤ 12.8). Wheels built for CUDA 13 (e.g. the newest vLLM/torch from plain `pip install`) need driver ≥ 580 and fail there. Pin cu126/cu128/cu129 wheels, or use NVIDIA's `cuda-compat` forward-compat libraries (data-center GPUs) on `LD_LIBRARY_PATH`. Check a node's driver inside a job with `nvidia-smi` before building large envs. Build envs with `uv pip install` into node-local `/tmp` then move to scratch — plain `pip` into `/scratch` took > 90 min once; `uv` took 3 min.
 
 ## Filesystem Layout
 
@@ -64,15 +115,20 @@ Explorer uses **fair-share scheduling** — your job priority depends on your gr
 
 ## Partitions Quick Reference
 
-| Partition | Max Time | Max Nodes | GPUs | Use Case |
-|---|---|---|---|---|
-| `short` | 24h | 2 | None | CPU jobs, conda setup, data processing |
-| `express` | 1h | 2 | None | Quick tests |
-| `debug` | 20min | 2 | None | Debugging |
-| `gpu-interactive` | 8h | 1 | 1 GPU | Interactive GPU dev/testing |
-| `gpu` | 8h | 1 | 1 GPU | Batch GPU training |
-| `gpu-short` | varies | 1 | 1 GPU | Short GPU jobs (H200 accessible here) |
-| `multigpu` | varies | varies | 2-8 GPUs | Multi-GPU (requires approval) |
+Source: [rc.northeastern.edu/partitions](https://rc.northeastern.edu/partitions/) (Oct 2026). Verify live with `scontrol show partition <name>`.
+
+| Partition | Approval | Time default / max | Running / submitted jobs per user | GPUs | Use Case |
+|---|---|---|---|---|---|
+| `short` | No | 4h / 48h | 50 / 1000 | None | CPU jobs, env builds, downloads, data prep (max 2 nodes) |
+| `long` | Yes | 1d / 5d | 25 / 1000 | None | Only if code cannot checkpoint |
+| `express` / `debug` | No | short | — | None | Quick tests, dry runs |
+| `sharing` | No | 30m / 60m | 2 / 4 | 1 | PI-shared GPUs, quick tests |
+| `gpu-short` | No | 1h / 2h | 2 / 4 | 1 | Short GPU jobs; **higher priority than `gpu`**; has H200 |
+| `gpu-interactive` | No | 1h / 2h | 2 / 4 | 1 | Interactive GPU dev (rejects >1 GPU) |
+| `gpu` | No | 4h / 8h | 4 / 8 | 1 per job, 4 per user | Batch GPU training |
+| `multigpu` | Yes | 12h / 24h | 4 / 8 | up to 8 | Needs a scaling test (efficiency > 0.5) to get access |
+
+The whole account (group) also has a 10,000-job cap; hitting it shows "job violates accounting/QOS policy". Arrays: max 50 running per user; throttle with `%N`. Monthly maintenance is the **first Tuesday**: no jobs run then, and jobs whose `--time` overlaps the window won't start before it.
 
 ## Module System
 
@@ -173,17 +229,21 @@ python train.py
 
 | GPU Type | VRAM | Nodes | GPUs/Node | Gres Flag | Notes |
 |---|---|---|---|---|---|
-| V100-SXM2 | 32GB | ~10 | 4 | `gpu:v100-sxm2:1` | Most available, shortest queue |
-| V100-PCIe | 16GB | 4 | 2 | `gpu:v100-pcie:1` | Fewer nodes, lower memory |
-| T4 | 16GB | 1 | 4 | `gpu:t4:1` | Inference-oriented, low power |
-| A100 | 80GB | 3 | 3-4 | `gpu:a100:1` | High performance, good availability |
-| H200 | 141GB | 4 | 8 | `gpu:h200:1` | Fastest, largest memory, may queue longer |
+| V100-SXM2 | 32GB | ~17 | 3-4 | `gpu:v100-sxm2:1` | Most nodes; no bf16/FP8 |
+| V100-PCIe | 16-32GB (check) | ~4 | 2-4 | `gpu:v100-pcie:1` | Some cards are 16GB (68M-param pair models OOM'd there) |
+| T4 | 16GB | 1-2 | 4 | `gpu:t4:1` | Slow; often shortest wait |
+| A100 40GB | 40GB | 1 | 2-3 | `gpu:a100:1` | `gpu:a100:1` can land here |
+| A100 80GB | 80GB | 2 | 4 | `gpu:a100:1 --constraint=a100@80g` | Only 8 cards; busy |
+| H200 | 141-144GB | 4 | 8 | `gpu:h200:1` | Fastest; ~100+ jobs often pending |
 
-**Recommendations:**
-- **Default choice:** `v100-sxm2` — most nodes, shortest wait
-- **Best performance:** `a100` or `h200` — 2-5x faster than V100 for training
-- **Any GPU:** omit the type (`gpu:1`) to accept whatever is available first
-- For large models or batch sizes, prefer A100/H200 for the extra VRAM
+Source: [rc.northeastern.edu/compute](https://rc.northeastern.edu/compute/); H100, L40S, A6000, A5000 are PI-owned (only via `sharing` or PI partitions). Live view: `sinfo -p gpu -h -o "%G|%f|%D|%T"`; pending demand per type: `squeue -p gpu -h -t PD -o "%b" | sort | uniq -c`. Node state MIXED refers to CPUs, not GPUs.
+
+**How to choose:**
+1. Smallest memory that fits the job (weights + activations + KV cache), with ~20% headroom.
+2. Among the types that fit, compare `sbatch --test-only -p gpu --gres=gpu:<type>:1 -c 4 --mem=32G -t 02:00:00 --wrap=true` and pick the earliest relative start.
+3. `gpu:1` (any type) starts soonest but may give a 16GB card — only for jobs that fit 16GB.
+4. Faster cards cost the same priority per hour, so a job that runs 3x faster on H200 uses 1/3 the priority — if the H200 queue isn't much longer.
+5. Exclude known-bad nodes with `--exclude=<node>` (e.g. a slow T4 node).
 
 ### Submit and manage:
 
@@ -287,6 +347,11 @@ scp -r ./my_project <username>@login.explorer.northeastern.edu:/scratch/<usernam
 rsync -avz ./data/ <username>@login.explorer.northeastern.edu:/scratch/<username>/data/
 ```
 
+- RC says large transfers **must** use the transfer node `xfer.discovery.neu.edu` (or Globus), not the login node ([docs](https://rc-docs.northeastern.edu/en/latest/datamanagement/transferringdata.html)).
+- If rsync fails with "unexpected end of file" / protocol errors, the login shell's `.bashrc`/MOTD is printing text; use `scp` per file, or fix `.bashrc` to print only for interactive shells.
+- Always exclude `.venv`, caches and checkpoints you don't need (`--exclude .venv --exclude '*.pt'`).
+- Use `-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15` for scripted ssh/scp so a dead connection fails instead of hanging; run **one** ssh at a time, never parallel background ssh loops.
+
 ## Containers (Apptainer)
 
 Apptainer is system-wide on Explorer (no module needed). Use it for reproducible environments:
@@ -329,7 +394,11 @@ check-quota                       # Disk usage (run from compute node)
 | Home quota exceeded | Move conda envs to `/scratch`, run `conda clean --all` |
 | `srun: error: Unable to allocate resources` | Partition may be full; try `sinfo -p <partition>` to check |
 | X11 forwarding fails | Use `ssh -Y` and ensure passwordless SSH is set up |
-| IdleBot warning email | You have allocated resources you are not using; release them with `scancel` |
+| IdleBot warning email | GPU under-used for 15 min; it cancels at 1 h. `scancel` now, add the in-job watchdog, move CPU-only work out of GPU jobs |
+| Pending for many hours, reason `Priority` | Low fair-share. Don't resubmit (loses age). Compare other GPU types with `--test-only`; use `gpu-short` if it fits in 2 h; merge pending steps into one job |
+| Job dies minutes after starting | Dry-run the script on a CPU node first; check `no_proxy`, paths that exist only on your laptop, env/driver mismatch (`nvidia-smi` driver vs wheel CUDA version) |
+| Local server in job returns HTTP 403 | Proxy catches localhost: `export no_proxy=localhost,127.0.0.1,::1` |
+| `sbatch` printed an error | It may still have created the job — `squeue -u <username>` before retrying |
 
 ## Common Mistakes
 
