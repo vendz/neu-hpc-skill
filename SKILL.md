@@ -18,11 +18,20 @@ description: >
 
 - **Host:** `login.explorer.northeastern.edu`
 - **Protocol:** SSH (port 22)
-- **SSH Command:** `ssh <username>@login.explorer.northeastern.edu`
-- **SSH with X11:** `ssh -Y <username>@login.explorer.northeastern.edu`
+- **SSH Command:** `ssh explorer` (X11: `ssh -Y explorer`), via the `explorer` entry in `~/.ssh/config`.
+- **Login keys (since 2026-11-06):** Northeastern passwords and self-made SSH keys are rejected; only the key Research Computing generated works ([guide](https://rc.northeastern.edu/2026/10/23/ssh-instructions-for-explorer/)). To get it again (new laptop, rotated key): Open OnDemand → Files → Home Directory → "Show dot files" → `.ssh` → download `<username>-<date>` and `<username>-<date>.pub` → move both to `~/.ssh/` → `chmod 600` the private key, `chmod 644` the `.pub`. Never delete files in `~/.ssh` on the cluster.
+- **If `ssh explorer` is not set up yet**, add to `~/.ssh/config`:
+  ```
+  Host explorer
+    HostName login.explorer.northeastern.edu
+    User <username>
+    IdentityFile ~/.ssh/<username>-<date>
+    IdentitiesOnly yes
+  ```
 
 ## Critical Rules
 
+0. **Read-only checks need no permission** (`squeue`, `sinfo`, `sshare`, `--test-only` estimates, reading logs). **Ask the user before anything that uses resources or changes state:** `sbatch`/`srun`, `scancel`/hold/release, copying or writing files, environment builds. Say what and why first.
 1. **NEVER run compute-intensive tasks on login nodes.** Always submit via `srun` (interactive) or `sbatch` (batch).
 2. **Always request only the resources you need** — over-requesting hurts your fair-share score AND increases queue wait time.
 3. **`/scratch/<username>`** is purged in the monthly maintenance window (first Tuesday; 20TB / 20M files limit; no backups). Copy results to `/home/<username>` after every job.
@@ -335,19 +344,19 @@ The `%5` limits concurrency to 5 simultaneous jobs. Each job gets its own alloca
 
 ```bash
 # From local machine to cluster
-scp local_file.py <username>@login.explorer.northeastern.edu:/home/<username>/
+scp local_file.py explorer:/home/<username>/
 
 # From cluster to local
-scp <username>@login.explorer.northeastern.edu:/home/<username>/results.csv ./
+scp explorer:/home/<username>/results.csv ./
 
 # Recursive directory copy
-scp -r ./my_project <username>@login.explorer.northeastern.edu:/scratch/<username>/
+scp -r ./my_project explorer:/scratch/<username>/
 
 # rsync (better for large transfers, resumes on failure)
-rsync -avz ./data/ <username>@login.explorer.northeastern.edu:/scratch/<username>/data/
+rsync -avz ./data/ explorer:/scratch/<username>/data/
 ```
 
-- RC says large transfers **must** use the transfer node `xfer.discovery.neu.edu` (or Globus), not the login node ([docs](https://rc-docs.northeastern.edu/en/latest/datamanagement/transferringdata.html)).
+- RC says large transfers **must** use the transfer node `xfer.discovery.neu.edu` (or Globus; `ssh -i ~/.ssh/<username>-<date> <username>@xfer.discovery.neu.edu`), not the login node ([docs](https://rc-docs.northeastern.edu/en/latest/datamanagement/transferringdata.html)).
 - If rsync fails with "unexpected end of file" / protocol errors, the login shell's `.bashrc`/MOTD is printing text; use `scp` per file, or fix `.bashrc` to print only for interactive shells.
 - Always exclude `.venv`, caches and checkpoints you don't need (`--exclude .venv --exclude '*.pt'`).
 - Use `-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15` for scripted ssh/scp so a dead connection fails instead of hanging; run **one** ssh at a time, never parallel background ssh loops.
@@ -375,8 +384,8 @@ check-quota                       # Disk usage (run from compute node)
 
 ## Common Workflow: Training a Model
 
-1. **SSH in:** `ssh <username>@login.explorer.northeastern.edu`
-2. **Transfer code:** `scp -r ./project <username>@login.explorer.northeastern.edu:/scratch/<username>/`
+1. **SSH in:** `ssh explorer`
+2. **Transfer code:** `scp -r ./project explorer:/scratch/<username>/`
 3. **Write sbatch script** (use templates above or in `scripts/`)
 4. **Create logs dir:** `mkdir -p /scratch/<username>/project/logs`
 5. **Submit:** `sbatch job.sh`
@@ -388,6 +397,7 @@ check-quota                       # Disk usage (run from compute node)
 
 | Problem | Solution |
 |---|---|
+| `Permission denied (publickey)` | Use the Research Computing key via `ssh explorer` (see Connection Details); check the private key is `chmod 600`. `ssh-copy-id` can't help, because password login is off. |
 | Job stuck in `PD` (pending) | Request fewer resources, use a less busy partition, or check fair-share score with `sshare -u <username>` |
 | `MODULE NOT FOUND` | Run `module avail <name>` to find correct version |
 | GPU not detected in PyTorch/TF | Ensure `cuda` module is loaded AND you are on a GPU node |
